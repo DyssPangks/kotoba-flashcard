@@ -69,8 +69,20 @@
             </button>
         </div>
 
+        <!-- Pencarian kosakata -->
+        <div class="mb-4">
+            <div class="relative">
+                <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input id="search-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                       placeholder="Cari kotoba: hiragana, romaji, atau arti"
+                       class="w-full h-11 pl-9 pr-10 border border-slate-200 rounded-xl bg-white text-sm focus:outline-none focus:border-teal-500">
+                <button id="search-clear" onclick="clearSearch()" aria-label="Hapus pencarian" class="hidden absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600">✕</button>
+            </div>
+            <div id="search-info" class="text-xs text-slate-400 mt-2 empty:hidden"></div>
+        </div>
+
         <!-- Tombol Mode Balik (berdiri sendiri) -->
-        <div class="mb-6">
+        <div id="mode-box" class="mb-6">
             <button id="btn-mode" onclick="toggleMode()" class="w-full flex items-center justify-center gap-2 bg-amber-50 text-amber-600 border border-amber-100 px-4 py-2.5 rounded-xl font-medium hover:bg-amber-100 transition-colors text-sm">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
                     <path d="M17 1l4 4-4 4"/>
@@ -83,7 +95,7 @@
         </div>
 
         <!-- Pagination & Bab Navigasi -->
-        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-6 text-center">
+        <div id="nav-box" class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-6 text-center">
             <div class="mb-4 text-[15px] text-slate-500">
                 <span class="font-bold text-teal-600 text-lg block mb-1" id="bab-title">Pelajaran 1</span>
                 Halaman <span class="font-bold text-teal-600" id="curr-page">1</span> dari <span id="tot-page">25</span> 
@@ -109,6 +121,9 @@
             </div>
         </div>
     </div>
+
+    <!-- Hasil Pencarian -->
+    <div id="search-results" class="hidden space-y-2 pb-8 no-print"></div>
 
     <!-- Cards Grid -->
     <div class="grid grid-cols-2 gap-4 pb-8 screen-only" id="flashcard-grid"></div>
@@ -1433,6 +1448,161 @@ function shareApp() {
     }
 }
 
+// ================= PENCARIAN =================
+const $ = id => document.getElementById(id);
+let searchIndex = [];
+const MAX_RESULTS = 200;
+
+function escHTML(str) {
+    return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Katakana -> hiragana + huruf kecil. Panjang teks tetap sama supaya posisi sorotan akurat.
+function foldText(str) {
+    return String(str)
+        .replace(/[\u30A1-\u30F6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
+        .toLowerCase();
+}
+
+function romajiKey(str) {
+    return String(str).toLowerCase().replace(/[^a-z]/g, '');
+}
+
+// Indeks dibuat sekali di awal (urutan asli bab), jadi tidak terpengaruh tombol "Acak Bab Ini"
+function buildSearchIndex() {
+    searchIndex = [];
+    babData.forEach((bab, i) => {
+        bab.forEach(item => {
+            const romaji = kanaToRomaji(item[0]);
+            searchIndex.push({
+                bab: i + 1, kana: item[0], arti: item[1], romaji: romaji,
+                kanaF: foldText(item[0]), kanaCore: foldText(item[0]).replace(/[~～〜\s]/g, ''),
+                artiF: foldText(item[1]), romKey: romajiKey(romaji)
+            });
+        });
+    });
+}
+
+// Skor kecocokan satu kata kunci terhadap satu entri (0 = tidak cocok)
+function scoreToken(e, t) {
+    let best = 0;
+    // hiragana / katakana
+    if (e.kanaF.includes(t)) best = Math.max(best, e.kanaCore === t ? 100 : e.kanaCore.startsWith(t) ? 60 : 20);
+    // romaji (hanya untuk kata kunci huruf latin murni)
+    const tr = /^[a-z]+$/.test(t) ? t : '';
+    if (tr && e.romKey.includes(tr)) best = Math.max(best, e.romKey === tr ? 90 : e.romKey.startsWith(tr) ? 50 : 15);
+    // arti
+    if (e.artiF.includes(t)) best = Math.max(best, e.artiF === t ? 80 : e.artiF.startsWith(t) ? 45 : 10);
+    return best;
+}
+
+function getTokens(query) {
+    return foldText(query)
+        .split(/\s+/)
+        .map(t => t.replace(/[~～〜]/g, ''))   // tanda ~ tidak ikut dicari
+        .filter(Boolean);
+}
+
+function searchEntries(tokens) {
+    const found = [];
+    searchIndex.forEach((e, idx) => {
+        let total = 0;
+        const ok = tokens.every(t => { const sc = scoreToken(e, t); total += sc; return sc > 0; });
+        if (ok) found.push({ e: e, total: total, idx: idx });
+    });
+    found.sort((a, b) => b.total - a.total || a.idx - b.idx);   // skor tinggi dulu, lalu urutan buku
+    return found.map(f => f.e);
+}
+
+function highlightText(raw, folded, tokens) {
+    if (raw.length !== folded.length) return escHTML(raw);
+    const mark = new Array(raw.length).fill(false);
+    tokens.forEach(t => {
+        let i = folded.indexOf(t);
+        while (i !== -1) {
+            for (let k = i; k < i + t.length; k++) mark[k] = true;
+            i = folded.indexOf(t, i + t.length);
+        }
+    });
+    let out = '', open = false;
+    for (let i = 0; i < raw.length; i++) {
+        if (mark[i] && !open) { out += '<mark class="bg-amber-200 text-slate-900 rounded px-0.5">'; open = true; }
+        if (!mark[i] && open) { out += '</mark>'; open = false; }
+        out += escHTML(raw[i]);
+    }
+    if (open) out += '</mark>';
+    return out;
+}
+
+function runSearch() {
+    const q = $('search-input').value.trim();
+    const active = q.length > 0;
+
+    $('search-clear').classList.toggle('hidden', !active);
+    $('search-clear').classList.toggle('flex', active);
+    ['nav-box', 'mode-box', 'flashcard-grid'].forEach(id => $(id).classList.toggle('hidden', active));
+    $('search-results').classList.toggle('hidden', !active);
+
+    if (!active) { $('search-info').textContent = ''; $('search-results').innerHTML = ''; return; }
+
+    const tokens = getTokens(q);
+    if (tokens.length === 0) {
+        $('search-info').textContent = 'Ketik hiragana, romaji, atau arti kosakata.';
+        $('search-results').innerHTML = '';
+        return;
+    }
+
+    const results = searchEntries(tokens);
+    const shown = results.slice(0, MAX_RESULTS);
+
+    $('search-info').textContent = results.length === 0
+        ? ''
+        : (results.length > MAX_RESULTS
+            ? `${results.length} hasil, menampilkan ${MAX_RESULTS} teratas. Persempit kata kuncinya.`
+            : `${results.length} hasil dari semua pelajaran`);
+
+    if (results.length === 0) {
+        $('search-results').innerHTML = `<div class="text-center text-sm text-slate-400 bg-white border border-slate-100 rounded-xl p-6">Tidak ada kosakata yang cocok dengan <b class="text-slate-600">${escHTML(q)}</b>.</div>`;
+        return;
+    }
+
+    $('search-results').innerHTML = shown.map(e => `
+        <div class="bg-white border border-slate-200 rounded-xl p-3 flex items-start gap-3">
+            <div class="flex-1 min-w-0">
+                <div class="kana-font text-lg font-bold text-slate-800 leading-snug break-words">${highlightText(e.kana, e.kanaF, tokens)}</div>
+                <div class="text-xs italic text-teal-600 mb-1">[${escHTML(e.romaji)}]</div>
+                <div class="text-sm text-slate-700 leading-snug break-words">${highlightText(e.arti, e.artiF, tokens)}</div>
+            </div>
+            <button onclick="openBab(${e.bab})" class="shrink-0 text-[11px] font-semibold text-teal-700 bg-teal-50 border border-teal-100 rounded-lg px-2 py-1 hover:bg-teal-100">Pelajaran ${e.bab}</button>
+        </div>`).join('');
+}
+
+function clearSearch() {
+    $('search-input').value = '';
+    runSearch();
+    $('search-input').focus();
+}
+
+// Buka pelajaran dari hasil pencarian
+function openBab(n) {
+    $('search-input').value = '';
+    runSearch();
+    currentBab = n;
+    renderCards();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function setupSearch() {
+    const input = $('search-input');
+    input.addEventListener('input', runSearch);
+    input.addEventListener('keydown', e => {
+        if (e.key === 'Escape') { input.value = ''; runSearch(); }
+        if (e.key === 'Enter') input.blur();   // tutup keyboard di HP
+    });
+}
+
+buildSearchIndex();
+setupSearch();
 renderCards();
 </script>
 
